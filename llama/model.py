@@ -77,7 +77,17 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+"""
+precompute_freqs_cis中的cis是 "cosine" 和 "sine" 的缩写，它经常在数学中使用来表示复数的极坐标形式。
+具体来说，给定一个角度theta，其对应的复数可以表示为：
+cis(theta) = cos(theta) + i*sin(theta), 即一般形式的欧拉公式
+"cis" 表示的是一个复数，其实部是角度θ的余弦值，而虚部是角度θ的正弦值, theta表示幅角 ,这种表示方法在复数分析、信号处理等领域中非常有用。
+
+因此，故名思义，该函数的目的是预计算一个复数频率张量。该函数有两个入参，dim和end。
+dim就是每个attention_head中的维度，在这里就是head_dim = hidden/head_num=4096/32=128。
+end是self.params.max_seq_len * 2，也就是4096，这也是Llama2最大的token处理数量。计算过程解释见注释：
+"""
+def precompute_freqs_cis(dim: int, seq_length: int, theta: float = 10000.0):
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
@@ -87,19 +97,41 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     Args:
         dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
+        seq_length (int): End index for precomputing frequencies.
         theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
 
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
     """
+    # dim = head_dim = 128
+    # seq_len = max_seq_len*2 = 4096
+    # 幅角最小单位：10000^(-2i/dim)
+    # torch.arange(0, dim, 2) [0, 2, 4, 6, 8, 10,..., 124, 126] 共64个
+    # torch.arange(0, dim, 2)[: (dim // 2)] 保证是64个
+    # freqs = [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)]
+    # freqs.shape: [dim//2]
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+    # index_of_seq: [0, 1, 2, ..., 4095]
+    # index_of_seq.shape:[end]
+    index_of_seq = torch.arange(seq_length, device=freqs.device)  # type: ignore
+    """
+    # freqs 得到 freqs和t的笛卡尔积，维度为:[seq_length, embed_dim//2] =（4096，64）
+    # freqs = [[0, 0, 0,..., 0],
+    #          [1/10000.0^(0/128), 1/10000.0^(2/128), 1/10000.0^(4/128), ..., 1/10000.0^(126/128)],
+    #          [2/10000.0^(0/128), 2/10000.0^(2/128), 2/10000.0^(4/128), ..., 2/10000.0^(126/128)],
+    #          ...,
+    #          [4095/10000.0^(0/128), 4095/10000.0^(2/128), 4095/10000.0^(4/128), ..., 4095/10000.0^(126/128)]]
+    其公式值为：
+    [
+        0*theta(0), 0*theta(1), ..., 0*theta(dim/2-1),
+        1*theta(0), 1*theta(1), ..., 1*theta(dim/2-1),
+        ...
+        m*theta(0), m*theta(1), ..., m*theta(dim/2-1),
+        ...
+        seq_len*theta(0), seq_len*theta(1), ..., seq_len*theta(dim/2-1),
+        ]
+    """
+    freqs = torch.outer(index_of_seq, freqs).float()  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -122,12 +154,21 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         AssertionError: If the frequency tensor doesn't match the expected shape.
         AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
     """
+    # 注意freqs_cis的维度并不是（4096，64），而是截取了seqlen的一部分，freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]。
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    # freqs_cis:[seq_length, embed_dim//2]
+    # x:[batch, query_seqlen, head_num, head_dim/2]
+    # 将freqs_cis.shape变为[batch=1, query_seqlen=1024, head_num=1, head_dim/2=64]
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
+
+"""
+与其它实现不同，meta的实现直接在复数空间相乘得到rope编码，即
+f(q,m)=q_complex*e^(i*m*theta)
+"""
 
 def apply_rotary_emb(
     xq: torch.Tensor,
